@@ -76,17 +76,7 @@ def run_kmeans_plotter(input_csv):
     y_scaled = scaler.fit_transform(y)
     X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns)
     y_scaled_df = pd.DataFrame(y_scaled, columns=['Wind Speed'])
-
     Xy_scaled = pd.concat([X_scaled_df, y_scaled_df], axis=1)
-
-    def optimise_k_means(Xy_scaled, max_k):
-        inertia = []
-        means = []
-        for k in range(1, max_k+1):
-            kmeans = KMeans(n_clusters=k, random_state=42)
-            kmeans.fit(Xy_scaled)
-            inertia.append(kmeans.inertia_)
-            means.append(k)
 
     print(Xy_scaled.columns.tolist())
     comparison = input("Choose a feature to compare with Wind Speed (e.g., 'hour', 'day_of_year'): ")
@@ -101,8 +91,6 @@ def run_kmeans_plotter(input_csv):
             print(f"Error during KMeans fitting: {e}")
     else:
         print(f"Column '{comparison}' not found in the dataset.")
-
-
 
     plt.figure(figsize=(8, 6))
     plt.scatter(Xy_scaled[comparison], Xy_scaled['Wind Speed'], c=Xy_scaled['kmeans_3'], cmap='viridis', alpha=0.6)
