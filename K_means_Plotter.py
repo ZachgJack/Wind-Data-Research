@@ -88,7 +88,7 @@ def run_kmeans_plotter(input_csv):
             inertia.append(kmeans.inertia_)
             means.append(k)
 
-    print(Xy_scaled.head())
+    print(Xy_scaled.columns.tolist())
     comparison = input("Choose a feature to compare with Wind Speed (e.g., 'hour', 'day_of_year'): ")
 
     if comparison in Xy_scaled.columns:
