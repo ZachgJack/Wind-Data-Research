@@ -3,16 +3,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import joblib
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import torch.optim as optim
+
+
 #import time
 
 #test1
-def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_epochs=60, batch_size=128, test_size=0.2, random_state=42):
+def train_and_evaluate_lstm(input_csv, model_save_path, 
+                            scaler_save_path, 
+                            num_epochs=60, 
+                            batch_size=128, 
+                            test_size=0.2, 
+                            random_state=42, 
+                            progress_callback=None, 
+                            date_from=None, 
+                            date_to=None):
+    
     # Check if CUDA is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -21,7 +32,25 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
         data = pd.read_csv(input_csv)
         data = data.loc[:, ~data.columns.str.contains('^Unnamed')]
         columns_to_drop = []
+        
+        # Find the datetime column case-insensitively
+        datetime_col = next((col for col in data.columns if col.lower() == "date time"), None)
 
+        if not datetime_col:
+            raise ValueError("No 'datetime' column found (case-insensitive match failed).")
+
+        # Normalize column to lowercase name "datetime" for downstream use
+        data['date time'] = pd.to_datetime(data[datetime_col], errors='coerce')
+        
+        # Drop original column if it's not already lowercase 'datetime'
+        if datetime_col != 'date time':
+            data.drop(columns=[datetime_col], inplace=True)
+        
+        if date_from and date_to:
+            data = data[(data['date time'] >= pd.Timestamp(date_from)) & 
+                    (data['date time'] <= pd.Timestamp(date_to))]
+            print(f"Filtered data between {date_from} and {date_to}. Remaining rows: {len(data)}")
+        
         for col in data.columns:
             data[col] = pd.to_numeric(data[col], errors='coerce')
             if data[col].isnull().all():
@@ -34,7 +63,6 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
         columns_to_drop, data = find_fully_nan_columns(input_csv)
         remaining_data = data.drop(columns=columns_to_drop)
 
-        # Eliminate stragling NaNs
         # Define a threshold for the maximum allowed percentage of NaNs
         threshold = 0.2
         # Step 1: Drop columns with too many NaNs
@@ -49,6 +77,8 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
 
         # Find target column(s) that contain "Wind Speed"
         wind_speed_cols = [col for col in remaining_data.columns if "wind speed" in col.lower()]
+        # Find target column(s) that contain "Solar Energy"
+        solar_energy_cols = [col for col in remaining_data.columns if "solar energy" in col.lower()]
 
         # Check if any were found
         if not wind_speed_cols:
@@ -58,13 +88,15 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
         target_col = wind_speed_cols[0]
         y = remaining_data[target_col].values
         X = remaining_data.drop(columns=[target_col])
+        X = X.drop(columns=['date time'], errors='ignore')
+
 
         print(f"X Shape: {X.shape}")
         print(f"y Shape: {y.shape}")
 
-        return X, y
+        return X, y, remaining_data
     
-    X, y = hunt_nans(input_csv)
+    X, y, remaining_data = hunt_nans(input_csv)
     print("Finished loading and processing data")
 
     #Split the data into training and testing sets
@@ -90,12 +122,13 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
     
 
     #Scale the data
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_data)
-    X_test_scaled = scaler.transform(X_test_data)
+    xscaler = MinMaxScaler()
+    yscaler = MinMaxScaler()
+    X_train_scaled = xscaler.fit_transform(X_train_data)
+    X_test_scaled = xscaler.transform(X_test_data)
     
-    y_train_data = scaler.fit_transform(y_train_data)
-    y_test_data = scaler.transform(y_test_data)
+    y_train_data = yscaler.fit_transform(y_train_data)
+    y_test_data = yscaler.transform(y_test_data)
     #Create sequences
     def create_sequences(X, y, seq_length):
         Xs, ys = [], []
@@ -104,15 +137,17 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
             ys.append(y[i+seq_length])
         return np.array(Xs), np.array(ys)
 
-    X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_data, seq_length=100)
-    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_data, seq_length=100)
+    X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_data, seq_length=48)
+    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_data, seq_length=48)
     X_train_seq = np.array(X_train_seq, dtype=np.float64)
 
     print("NaNs in X_train:", np.isnan(X_train_seq).sum())
     print("NaNs in y_train:", np.isnan(y_train_seq).sum())
 
     # Save the scaler for future use
-    joblib.dump(scaler, scaler_save_path)
+    joblib.dump(xscaler, scaler_save_path)
+    joblib.dump(yscaler, scaler_save_path.replace('.pkl', '_y.pkl'))
+    print("Finished saving scalers")
 
     # Convert data to PyTorch tensors and move to the device (GPU or CPU)
     X_train = torch.tensor(X_train_seq, dtype=torch.float32).to(device)
@@ -125,10 +160,11 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
     test_dataset = TensorDataset(X_test, y_test)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    print("Finished creating DataLoaders")
 
     # Define the LSTM model
     class LSTMModel(nn.Module):
-        def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0.3):
+        def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0.2):
             super(LSTMModel, self).__init__()
             self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_rate)
             self.fc = nn.Linear(hidden_size, 1)  # Output 1 value (Wind Speed)
@@ -141,14 +177,14 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
             return out
 
     input_size = X_train.shape[2]  # Number of features
-    hidden_size = 64  # Number of LSTM units
+    hidden_size = 32  # Number of LSTM units
     num_layers = 2  # Number of LSTM layers
 
     model = LSTMModel(input_size, hidden_size, num_layers).to(device)
 
     # Define loss function and optimizer with L2 regularization
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
 
     # Train the model
     train_losses = []
@@ -157,6 +193,7 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
+        
         for inputs, targets in train_loader:
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -165,20 +202,26 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
             optimizer.step()
             running_loss += loss.item()
         
-        train_losses.append(running_loss / len(train_loader))
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
         
         model.eval()
-        test_loss = 0.0
+        running_test_loss = 0.0
         with torch.no_grad():
             for inputs, targets in test_loader:
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
-                test_loss += loss.item()
+                running_test_loss += loss.item()
         
-        test_losses.append(test_loss / len(test_loader))
-        scheduler.step(test_losses[-1])
+        avg_test_loss = running_test_loss / len(test_loader)
+        test_losses.append(avg_test_loss)
+
+        scheduler.step(avg_test_loss)
 
         print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_losses[-1]:.4f}, Test Loss: {test_losses[-1]:.4f}, LR = {optimizer.param_groups[0]["lr"]:.6f}')
+
+        if progress_callback:
+            progress_callback(train_losses[:], test_losses[:])
 
     # Save the model
     torch.save(model.state_dict(), model_save_path)
@@ -236,22 +279,14 @@ def train_and_evaluate_lstm(input_csv, model_save_path, scaler_save_path, num_ep
     })
     metrics_df.to_csv('evaluation_metrics.csv', index=False)
 
-    # Plot training & validation loss values
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(test_losses, label='Test Loss')
-    plt.title('Model Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig('loss_plot.png')
-    plt.show()
+    return train_losses, test_losses, remaining_data, input_size
 
 
 
 
 
 
-def predict(model_path, scaler_path, input_csv, output_csv, plot_path=None):
+def predict(model_path, scaler_path, input_csv, output_csv, date_from, date_to, feature_size, plot_path=None):
     # Check if CUDA is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -271,123 +306,93 @@ def predict(model_path, scaler_path, input_csv, output_csv, plot_path=None):
             return out
 
     # Load the trained model
-    input_size = 12  # Adjust according to your number of features
-    hidden_size = 64  # Same as in training
+    input_size = feature_size  # Adjust according to your number of features
+    hidden_size = 32  # Same as in training
     num_layers = 2  # Same as in training
     model = LSTMModel(input_size, hidden_size, num_layers).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
     # Load the scaler
-    scaler = joblib.load(scaler_path)
+    xscaler = joblib.load(scaler_path)
+    yscaler = joblib.load(scaler_path.replace('.pkl', '_y.pkl'))
+    data = input_csv
+    # Find the datetime column case-insensitively
+    datetime_col = next((col for col in data.columns if col.lower() == "date time"), None)
+
+    if not datetime_col:
+        raise ValueError("No 'datetime' column found (case-insensitive match failed).")
+
+    # Normalize column to lowercase name "datetime" for downstream use
+    data['date time'] = pd.to_datetime(data[datetime_col])
+    
+    # Drop original column if it's not already lowercase 'datetime'
+    if datetime_col != 'date time':
+        data.drop(columns=[datetime_col], inplace=True)
+
 
     # Load new data for prediction
-    new_data = pd.read_csv(input_csv)
+    new_data = input_csv
     print('Finished loading new data')
 
-    # Extract features (X) for prediction and drop 'Wind Speed'
-    X_new = new_data.drop('Wind Speed', axis=1).values
+    # --- Calculate date range in terms of duration and relative offset ---
+    duration = date_to - date_from
+    print(f"Original duration: {duration}")
+
+    # --- Find the last year in the dataset ---
+    latest_year = data['date time'].dt.year.max()
+    print(f"Latest year in dataset: {latest_year}")
+
+    # Align the target prediction window with the same month/day but latest year
+    target_from = date_from.replace(year=latest_year)
+    target_to = target_from + duration
+
+    target_from = pd.to_datetime(target_from)
+    target_to = pd.to_datetime(target_to)
+
+    # --- Filter the prediction input ---
+    pred_df = data[(data['date time'] >= target_from) & (data['date time'] <= target_to)].copy()
+    print(f"Prediction window: {target_from.date()} to {target_to.date()}")
+    print(f"Filtered rows: {len(pred_df)}")
+
+    def create_inference_sequences(X, seq_length):
+        sequences = []
+        for i in range(len(X) - seq_length):
+            sequences.append(X[i:i+seq_length])
+        return np.array(sequences)
+
+    
+    # Drop target variable (e.g., 'Wind Speed') from inputs
+    X_new = pred_df.drop(columns=['Wind Speed', 'date time'], errors='ignore').values
 
     # Standardize the features
-    X_new_scaled = scaler.transform(X_new)
+    X_new_scaled = xscaler.transform(X_new)
+    X_new_scaled_seq = create_inference_sequences(X_new_scaled, 48)
 
-    # Reshape the data for LSTM [batch_size, sequence_length, num_features]
-    X_new_scaled = X_new_scaled.reshape((X_new_scaled.shape[0], 1, X_new_scaled.shape[1]))
-
-    # Convert data to PyTorch tensors and move to the device (GPU or CPU)
-    X_new_tensor = torch.tensor(X_new_scaled, dtype=torch.float32).to(device)
-
+    X_new_tensor = torch.tensor(X_new_scaled_seq, dtype=torch.float32).to(device)
+    batch_size = 128
+    dataset = TensorDataset(X_new_tensor)
+    loader = DataLoader(dataset, batch_size=batch_size)
     # Make predictions
+    predictions = []
     with torch.no_grad():
-        predictions = model(X_new_tensor).cpu().numpy()
+        for batch in loader:
+            X_batch = batch[0].to(device)
+            y_batch_pred = model(X_batch)
+            predictions.append(y_batch_pred.cpu())
 
-    # Save predictions to CSV
-    prediction_df = pd.DataFrame(predictions, columns=['Predicted Wind Speed'])
-    prediction_df.to_csv(output_csv, index=False)
-
-    # Plot predictions
-    if plot_path:
-        plt.figure(figsize=(12, 6))
-        plt.plot(predictions, label='Predicted Wind Speed')
-        plt.title('Predicted Wind Speed')
-        plt.xlabel('Time')
-        plt.ylabel('Wind Speed')
-        plt.legend()
-        plt.savefig(plot_path)
-        plt.show()
-
-    print("Finished making predictions")
-
-
-
-
-
-def find_best_week(predictions_csv, actual_csv, plot_path=None):
-    # Read the predicted data
-    pred_df = pd.read_csv(predictions_csv)
-    pred = pred_df['Predicted Wind Speed'].values
-    pred[pred < 0] = 0  # Set everything below zero to zero
-
-    # Read the actual data
-    actual_df = pd.read_csv(actual_csv)
-    actual = actual_df['Wind Speed'].values
-
-    # Ensure both arrays have the same length
-    min_length = min(len(pred), len(actual))
-    pred = pred[:min_length]
-    actual = actual[:min_length]
-
-    r2_array = []
-    # Split pred and actual by weeks (24*7)
-    for i in range(0, len(pred), 24*7):
-        pred_week = pred[i:i+24*7]
-        actual_week = actual[i:i+24*7]
-        # Calculate the mean of the actual values
-        mean_actual = np.mean(actual_week)
-
-        # Calculate the total sum of squares
-        ss_total = np.sum((actual_week - mean_actual) ** 2)
-
-        # Calculate the residual sum of squares
-        ss_res = np.sum((actual_week - pred_week) ** 2)
-
-        # Calculate the R-squared value
-        r2 = 1 - (ss_res / ss_total)
-        r2_array.append(r2)
-
-    # Find the week with the maximum R-squared value
-    max_r2 = max(r2_array)
-    index = r2_array.index(max_r2)
-    print(f'Max R-squared: {max_r2:.4f}')
-    print(f'Index: {index}')
-
-    # Calculate RMSE for that week
-    rmse = np.sqrt(np.mean((actual[index*24*7:index*24*7+24*7] - pred[index*24*7:index*24*7+24*7]) ** 2))
-    print(f'RMSE: {rmse:.4f}')
-
-    # Calculate MAE for that week
-    mae = np.mean(np.abs(actual[index*24*7:index*24*7+24*7] - pred[index*24*7:index*24*7+24*7]))
-    print(f'Mean Absolute Error: {mae:.4f}')
-
-    # Plot the week for actual and prediction with that index
-    pred_week = pred[index*24*7:index*24*7+24*7]
-    actual_week = actual[index*24*7:index*24*7+24*7]
-    days = ['Day 1', 'Day 2', 'Day 3', 'Day 4', 'Day 5', 'Day 6', 'Day 7']
-    xticks = [i for i in range(0, 24*7, 24)]
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(actual_week, label='Actual Wind Speed')
-    plt.plot(pred_week, label='Predicted Wind Speed')
-    plt.title(f'Actual vs Predicted Wind Speed - Best Week\nR-squared: {max_r2:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}')
-    plt.xlabel('Time (Days)')
-    plt.xticks(xticks, days)
-    plt.ylabel('Wind Speed')
-    plt.legend()
-
-    if plot_path:
-        plt.savefig(plot_path)
+    # Concatenate all batches
+    predictions = torch.cat(predictions, dim=0).numpy()    
+    valid_dates = pred_df['date time'].values[48:]  # Skip first 48 to match the number of sequences
     
-    plt.show()
+    #Reshape predictions to match the expected output
+    predictions = yscaler.inverse_transform(predictions)
+    
+    prediction_df = pd.DataFrame({
+        'date time': valid_dates,
+        'Predicted Wind Speed': predictions.flatten()
+    })
+    prediction_df.to_csv(output_csv, index=False)
+    print(f"Predictions saved to {output_csv}")
 
-    return max_r2, rmse, mae
-
+    return prediction_df
