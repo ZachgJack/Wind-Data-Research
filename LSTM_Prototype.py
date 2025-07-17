@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 import joblib
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import torch.optim as optim
-
+from sklearn.linear_model import LinearRegression
+from scipy.stats import pearsonr
 
 #import time
 
@@ -17,12 +18,13 @@ import torch.optim as optim
 def train_and_evaluate_lstm(input_csv, model_save_path, 
                             scaler_save_path, 
                             num_epochs=60, 
-                            batch_size=128, 
+                            batch_size=16, 
                             test_size=0.2, 
                             random_state=42, 
                             progress_callback=None, 
                             date_from=None, 
-                            date_to=None):
+                            date_to=None,
+                            use_solar=False):
     
     # Check if CUDA is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -62,10 +64,11 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
         # Drop fully NaN columns
         columns_to_drop, data = find_fully_nan_columns(input_csv)
         remaining_data = data.drop(columns=columns_to_drop)
+        
 
         # Define a threshold for the maximum allowed percentage of NaNs
-        threshold = 0.2
-        # Step 1: Drop columns with too many NaNs
+        threshold = 0.5
+        #Step 1: Drop columns with too many NaNs
         min_non_nany = int((1 - threshold) * remaining_data.shape[0])
         masky = remaining_data.notna().sum(axis=0) >= min_non_nany
         remaining_data = remaining_data.loc[:, masky]
@@ -74,18 +77,21 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
         min_non_nanx = int((1 - threshold) * remaining_data.shape[1])
         maskx = remaining_data.notna().sum(axis=1) >= min_non_nanx
         remaining_data = remaining_data.loc[maskx]
+        
 
-        # Find target column(s) that contain "Wind Speed"
-        wind_speed_cols = [col for col in remaining_data.columns if "wind speed" in col.lower()]
-        # Find target column(s) that contain "Solar Energy"
-        solar_energy_cols = [col for col in remaining_data.columns if "solar energy" in col.lower()]
-
-        # Check if any were found
-        if not wind_speed_cols:
-            raise ValueError("No column found containing 'Wind Speed'.")
-
-        # Use the first matching column as target
-        target_col = wind_speed_cols[0]
+        if use_solar:
+            # Find target column(s) that contain "Solar Radiation"
+            solar_radiation_cols = [col for col in remaining_data.columns if "solar radiation" in col.lower()]
+            if not solar_radiation_cols:
+                raise ValueError("No column found containing 'Solar Radiation'.")
+            target_col = solar_radiation_cols[0]
+        else:
+            # Find target column(s) that contain "Wind Speed"
+            wind_speed_cols = [col for col in remaining_data.columns if "wind speed" in col.lower()]
+            if not wind_speed_cols:
+                raise ValueError("No column found containing 'Wind Speed'.")
+            target_col = wind_speed_cols[0]
+        
         y = remaining_data[target_col].values
         X = remaining_data.drop(columns=[target_col])
         X = X.drop(columns=['date time'], errors='ignore')
@@ -114,6 +120,7 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
         if X_test_data[col].isna().sum() > 0:
             X_test_data[col] = X_test_data[col].fillna(X_test_data[col].mean())
 
+    #Convert y_train_data and y_test_data to 2D arrays
     y_train_data = pd.Series(y_train_data.flatten())
     y_train_data = y_train_data.fillna(y_train_data.mean()).values.reshape(-1, 1)
     
@@ -122,8 +129,8 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
     
 
     #Scale the data
-    xscaler = MinMaxScaler()
-    yscaler = MinMaxScaler()
+    xscaler = StandardScaler()
+    yscaler = StandardScaler()
     X_train_scaled = xscaler.fit_transform(X_train_data)
     X_test_scaled = xscaler.transform(X_test_data)
     
@@ -137,8 +144,8 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
             ys.append(y[i+seq_length])
         return np.array(Xs), np.array(ys)
 
-    X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_data, seq_length=48)
-    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_data, seq_length=48)
+    X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_data, seq_length=24)
+    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_data, seq_length=24)
     X_train_seq = np.array(X_train_seq, dtype=np.float64)
 
     print("NaNs in X_train:", np.isnan(X_train_seq).sum())
@@ -177,14 +184,14 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
             return out
 
     input_size = X_train.shape[2]  # Number of features
-    hidden_size = 32  # Number of LSTM units
-    num_layers = 2  # Number of LSTM layers
+    hidden_size = 16  # Number of LSTM units
+    num_layers = 1  # Number of LSTM layers
 
     model = LSTMModel(input_size, hidden_size, num_layers).to(device)
 
     # Define loss function and optimizer with L2 regularization
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=0.0003, weight_decay=5e-4)
 
     # Train the model
     train_losses = []
@@ -253,15 +260,32 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
     y_train_pred = np.array(y_train_pred)
     y_train_np = y_train.cpu().numpy()
 
+    y_test = yscaler.inverse_transform(y_test.cpu().numpy())
+    y_test_pred = yscaler.inverse_transform(y_test_pred)
+    
+    
+    corr, _ = pearsonr(y_test.flatten(), y_test_pred.flatten())
+    print("Pearson Correlation:", corr)
+
     # Calculate R^2, MAE, and RMSE for the test set
-    r2_test = r2_score(y_test_np, y_test_pred)
-    mae_test = mean_absolute_error(y_test_np, y_test_pred)
-    rmse_test = np.sqrt(mean_squared_error(y_test_np, y_test_pred))
+    y_test_np_unscaled = yscaler.inverse_transform(y_test_np)
+    r2_test = r2_score(y_test_np_unscaled, y_test_pred)
+    mae_test = mean_absolute_error(y_test_np_unscaled, y_test_pred)
+    rmse_test = np.sqrt(mean_squared_error(y_test_np_unscaled, y_test_pred))
+
 
     # Calculate R^2, MAE, and RMSE for the training set
-    r2_train = r2_score(y_train_np, y_train_pred)
-    mae_train = mean_absolute_error(y_train_np, y_train_pred)
-    rmse_train = np.sqrt(mean_squared_error(y_train_np, y_train_pred))
+    y_train_np_unscaled = yscaler.inverse_transform(y_train_np)
+    r2_train = r2_score(y_train_np_unscaled, y_train_pred)
+    mae_train = mean_absolute_error(y_train_np_unscaled, y_train_pred)
+    rmse_train = np.sqrt(mean_squared_error(y_train_np_unscaled, y_train_pred))
+
+    # Calculate baseline R^2 using Linear Regression
+    r2_baseline = LinearRegression().fit(X_train_scaled, y_train_data).score(X_test_scaled, y_test_data)
+    print(f"Baseline Linear Regression R²: {r2_baseline:.4f}")
+    r2_persist = r2_score(y_test_np_unscaled[1:], y_test_np_unscaled[:-1])
+    print(f'Persistence R²: {r2_persist:.4f}')
+
 
     # Print the results
     print(f'R^2 Score (Test): {r2_test:.4f}')
@@ -286,11 +310,19 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
 
 
 
-def predict(model_path, scaler_path, input_csv, output_csv, date_from, date_to, feature_size, plot_path=None):
+def predict(model_path,
+            scaler_path,
+            input_csv,
+            output_csv,
+            date_from,
+            date_to,
+            feature_size,
+            use_solar=False,
+            plot_path=None):
     # Check if CUDA is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-
+ 
     # Define the LSTM model class
     class LSTMModel(nn.Module):
         def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0.3):
@@ -307,8 +339,8 @@ def predict(model_path, scaler_path, input_csv, output_csv, date_from, date_to, 
 
     # Load the trained model
     input_size = feature_size  # Adjust according to your number of features
-    hidden_size = 32  # Same as in training
-    num_layers = 2  # Same as in training
+    hidden_size = 16  # Same as in training
+    num_layers = 1  # Same as in training
     model = LSTMModel(input_size, hidden_size, num_layers).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -361,16 +393,18 @@ def predict(model_path, scaler_path, input_csv, output_csv, date_from, date_to, 
             sequences.append(X[i:i+seq_length])
         return np.array(sequences)
 
-    
-    # Drop target variable (e.g., 'Wind Speed') from inputs
-    X_new = pred_df.drop(columns=['Wind Speed', 'date time'], errors='ignore').values
+    # Prepare the input data for prediction
+    X_new = pred_df[xscaler.feature_names_in_].copy()
+
+    X_new = X_new.ffill().bfill()  # Fill NaNs with forward and backward fill
 
     # Standardize the features
     X_new_scaled = xscaler.transform(X_new)
-    X_new_scaled_seq = create_inference_sequences(X_new_scaled, 48)
+
+    X_new_scaled_seq = create_inference_sequences(X_new_scaled, seq_length=24)
 
     X_new_tensor = torch.tensor(X_new_scaled_seq, dtype=torch.float32).to(device)
-    batch_size = 128
+    batch_size = 16
     dataset = TensorDataset(X_new_tensor)
     loader = DataLoader(dataset, batch_size=batch_size)
     # Make predictions
@@ -380,18 +414,26 @@ def predict(model_path, scaler_path, input_csv, output_csv, date_from, date_to, 
             X_batch = batch[0].to(device)
             y_batch_pred = model(X_batch)
             predictions.append(y_batch_pred.cpu())
-
+    
     # Concatenate all batches
-    predictions = torch.cat(predictions, dim=0).numpy()    
-    valid_dates = pred_df['date time'].values[48:]  # Skip first 48 to match the number of sequences
+    predictions = torch.cat(predictions, dim=0).numpy()   
+    valid_dates = pred_df['date time'].values[24:]  # Skip first 24 to match the number of sequences
     
     #Reshape predictions to match the expected output
     predictions = yscaler.inverse_transform(predictions)
     
-    prediction_df = pd.DataFrame({
-        'date time': valid_dates,
-        'Predicted Wind Speed': predictions.flatten()
-    })
+    if use_solar:
+        prediction_df = pd.DataFrame({
+            'date time': valid_dates,
+            'Predicted Solar Radiation': predictions.flatten()
+        })
+    else:
+        prediction_df = pd.DataFrame({
+            'date time': valid_dates,
+            'Predicted Wind Speed': predictions.flatten()
+        })    
+        
+    prediction_df = prediction_df.sort_values('date time')
     prediction_df.to_csv(output_csv, index=False)
     print(f"Predictions saved to {output_csv}")
 
