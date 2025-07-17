@@ -18,7 +18,7 @@ class LSTMWorker(QObject):
     plot_data_signal = Signal(list, list)
     epoch_update_signal = Signal(list, list)
 
-    def __init__(self, file_path, model_path, scaler_path, output_queue, date_from=None, date_to=None):
+    def __init__(self, file_path, model_path, scaler_path, output_queue, date_from=None, date_to=None, use_solar=False):
         super().__init__()
         self.file_path = file_path
         self.model_path = model_path
@@ -26,6 +26,7 @@ class LSTMWorker(QObject):
         self.output_queue = output_queue
         self.date_from = date_from
         self.date_to = date_to
+        self.use_solar = use_solar 
 
     def run(self):
         sys.stdout = QueueStream(self.output_queue)
@@ -46,6 +47,7 @@ class LSTMWorker(QObject):
                 progress_callback=emit_epoch,
                 date_from=self.date_from,
                 date_to=self.date_to,
+                use_solar=self.use_solar
                 
             )
             print("Training completed.")
@@ -57,7 +59,8 @@ class LSTMWorker(QObject):
                 output_csv="prediction_output.csv",
                 date_from=self.date_from,
                 date_to=self.date_to,
-                feature_size=input_size
+                feature_size=input_size,
+                use_solar=self.use_solar
             )
             # Load the processed CSV file
             df = remaining_data
@@ -65,10 +68,13 @@ class LSTMWorker(QObject):
             # Slice to the same date range as the predictions
             df["date time"] = pd.to_datetime(df["date time"])  # or whatever column
             mask = (df["date time"] >= pd.to_datetime(self.date_from)) & (df["date time"] <= pd.to_datetime(self.date_to))
-            y_true = df.loc[mask, "Wind Speed"].tolist()  # Replace with actual column name
-
-            # Plotting: directly access the main window and call its method
-            MainWindow.instance.update_prediction_plot(y_true, predictions['Predicted Wind Speed'].tolist())
+            if self.use_solar:
+                y_true = df.loc[mask, "Solar Radiation"].tolist()
+                MainWindow.instance.update_prediction_plot(y_true, predictions['Predicted Solar Radiation'].tolist())
+            else:
+                y_true = df.loc[mask, "Wind Speed"].tolist()  # Replace with actual column name
+                # Plotting: directly access the main window and call its method
+                MainWindow.instance.update_prediction_plot(y_true, predictions['Predicted Wind Speed'].tolist())
 
         except Exception as e:
             traceback.print_exc()
@@ -115,6 +121,8 @@ class MainWindow(QMainWindow):
     # It checks if a file has been dropped, initializes the LSTM worker,
     # and starts the training in a separate thread.
     def run_action(self):
+        is_solar = self.ui.targetToggle.isChecked()
+
         if not self.drop_area.file_path:
             self.terminal.append_output("No file has been dropped yet.")
             return
@@ -125,39 +133,51 @@ class MainWindow(QMainWindow):
         to_date = self.ui.dateTo.date().toPython()
 
         # Create a new thread and worker for LSTM training
-        self.thread = QThread()
-        self.worker = LSTMWorker(
+        # Scoped instances so we don't pollute the main object
+        thread = QThread(parent=self)  # attach to MainWindow for cleanup
+        worker = LSTMWorker(
             self.drop_area.file_path,
             model_save_path,
             scalar_save_path,
             self.output_queue,
             date_from=from_date,
-            date_to=to_date
+            date_to=to_date,
+            use_solar=is_solar
         )
-        
-        # Connect signals to slots
-        self.worker.moveToThread(self.thread)
-        self.worker.plot_data_signal.connect(self.update_loss_plot)
-        self.worker.epoch_update_signal.connect(self.update_loss_plot)
-        self.worker.finished_signal.connect(self.thread.quit)
-        self.worker.finished_signal.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.started.connect(self.worker.run)
-        self.thread.start()
 
-        self.terminal.append_output("⏳ Running LSTM training in background...")   
+        # Classic Qt move: store as attributes so garbage collector doesn't nuke them early
+        self.current_thread = thread
+        self.current_worker = worker
+
+        # Move to thread
+        worker.moveToThread(thread)
+
+        # Connect signals BEFORE thread starts
+        thread.started.connect(worker.run)
+        worker.plot_data_signal.connect(self.update_loss_plot)
+        worker.epoch_update_signal.connect(self.update_loss_plot)
+
+        # Teardown logic (separate everything clearly)
+        def cleanup():
+            self.terminal.append_output("LSTM run complete.")
+            thread.quit()
+            thread.wait()  # ensure thread finishes before deletion
+            worker.deleteLater()
+            thread.deleteLater()
+            self.current_worker = None
+            self.current_thread = None
+            self.ui.pushButton.setEnabled(True)
+
+        worker.finished_signal.connect(cleanup)
+
+        # Start
+        self.terminal.append_output("⏳ Starting LSTM run...")
+        thread.start()  
 
     def handle_terminal_input(self, user_input):
         user_input = user_input.strip().lower()
 
-        if user_input == "wind":
-            self.target_type = "wind_speed"
-            self.terminal.append_output("Using wind speed as the LSTM target.")
-        elif user_input == "solar":
-            self.target_type = "solar_radiation"
-            self.terminal.append_output("Using solar radiation as the LSTM target.")
-        else:
-            self.terminal.append_output("Invalid input. Please enter 'wind' or 'solar'.")
+
 
     def update_loss_plot(self, train_losses, test_losses):
         self.loss_canvas.ax.clear()
@@ -170,12 +190,17 @@ class MainWindow(QMainWindow):
         self.loss_canvas.draw()
 
     def update_prediction_plot(self, y_true, y_pred):
+        is_solar = self.ui.targetToggle.isChecked()
+
         self.pred_canvas.ax.clear()
         self.pred_canvas.ax.plot(y_true, label="True")
         self.pred_canvas.ax.plot(y_pred, label="Predicted")
         self.pred_canvas.ax.set_title("Predictions vs Actual")
         self.pred_canvas.ax.set_xlabel("Time Step")
-        self.pred_canvas.ax.set_ylabel("Target Value")
+        if is_solar:
+            self.pred_canvas.ax.set_ylabel("Solar Radiation (W/m²)")
+        else:
+            self.pred_canvas.ax.set_ylabel("Wind Speed (m/s)")
         self.pred_canvas.ax.legend()
         self.pred_canvas.draw()
 
@@ -207,8 +232,13 @@ class TerminalWidget(QWidget):
 
     def _handle_user_input(self):
         text = self.input.text().strip()
-        self.append_output(f"> {text}")
         self.input.clear()
+
+        if text.lower() == "clear":
+            self.output.clear()
+            return
+
+        self.append_output(f"> {text}")
         self.user_input_signal.emit(text)
 
     def append_output(self, text):
@@ -282,12 +312,6 @@ class DropArea(QLabel):
             df = pd.read_csv(path)
             self.df = df  # Save DataFrame for later use
             self.setText(f"Loaded: {path.split('/')[-1]}\n{df.shape[0]} rows × {df.shape[1]} columns")
-            for col in df.columns:
-                if "solar energy" in col.lower():
-                    if self.terminal:
-                        self.terminal.append_output("CSV loaded. Detected targets: wind_speed, solar_radiation.")
-                        self.terminal.append_output("Which target would you like to use for the LSTM? (wind/solar)")
-                    break  
                 
         except Exception as e:
             print(f"Failed to read file:\n{e}")
