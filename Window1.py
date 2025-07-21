@@ -36,12 +36,12 @@ class LSTMWorker(QObject):
             self.epoch_update_signal.emit(train_losses, test_losses)
 
         try:
-            train_losses, test_losses, remaining_data, input_size = train_and_evaluate_lstm(
+            train_losses, test_losses, remaining_data, input_size, persistence_mode = train_and_evaluate_lstm(
                 self.file_path,
                 model_save_path=self.model_path,
                 scaler_save_path=self.scaler_path,
                 num_epochs=60,
-                batch_size=32,
+                batch_size=16,
                 test_size=0.2,
                 random_state=42,
                 progress_callback=emit_epoch,
@@ -60,21 +60,46 @@ class LSTMWorker(QObject):
                 date_from=self.date_from,
                 date_to=self.date_to,
                 feature_size=input_size,
-                use_solar=self.use_solar
+                use_solar=self.use_solar,
+                persistence_mode=persistence_mode
             )
             # Load the processed CSV file
-            df = remaining_data
+            df = pd.read_csv(self.file_path)
+            # Detect the real datetime column (case-insensitive)
+            datetime_col = next((col for col in df.columns if col.lower() == "date time"), None)
+            if not datetime_col:
+                raise ValueError("No 'date time' column found.")
 
-            # Slice to the same date range as the predictions
-            df["date time"] = pd.to_datetime(df["date time"])  # or whatever column
-            mask = (df["date time"] >= pd.to_datetime(self.date_from)) & (df["date time"] <= pd.to_datetime(self.date_to))
+            # Drop rows where the datetime column has the header string (or anything non-parsable)
+            df = df[df[datetime_col].str.lower() != "date time"]
+
+            # Now convert it safely
+            df["date time"] = pd.to_datetime(df[datetime_col], errors='coerce')
+            if datetime_col != "date time":
+                df.drop(columns=[datetime_col], inplace=True)
+            
+            latest_year = df["date time"].dt.year.max()
+            print("Latest year used for comparison:", latest_year)
+            # Replace the year in the original date range
+            adjusted_from = pd.to_datetime(self.date_from).replace(year=int(latest_year))
+            adjusted_to = pd.to_datetime(self.date_to).replace(year=int(latest_year))
+
+            mask = (df["date time"] >= adjusted_from) & (df["date time"] <= adjusted_to)
+            
+            # Coerce to numeric
+            if self.use_solar:
+                df["Solar Radiation"] = pd.to_numeric(df["Solar Radiation"], errors='coerce')
+            else:
+                df["Wind Speed"] = pd.to_numeric(df["Wind Speed"], errors='coerce')
+            df = df.dropna(subset=["Solar Radiation"] if self.use_solar else ["Wind Speed"])
+            
             if self.use_solar:
                 y_true = df.loc[mask, "Solar Radiation"].tolist()
-                MainWindow.instance.update_prediction_plot(y_true, predictions['Predicted Solar Radiation'].tolist())
+                MainWindow.instance.update_prediction_plot(y_true, predictions['Predicted Solar Radiation'].tolist(), year=int(latest_year))
             else:
                 y_true = df.loc[mask, "Wind Speed"].tolist()  # Replace with actual column name
                 # Plotting: directly access the main window and call its method
-                MainWindow.instance.update_prediction_plot(y_true, predictions['Predicted Wind Speed'].tolist())
+                MainWindow.instance.update_prediction_plot(y_true, predictions['Predicted Wind Speed'].tolist(), year=int(latest_year))
 
         except Exception as e:
             traceback.print_exc()
@@ -189,13 +214,13 @@ class MainWindow(QMainWindow):
         self.loss_canvas.ax.legend()
         self.loss_canvas.draw()
 
-    def update_prediction_plot(self, y_true, y_pred):
+    def update_prediction_plot(self, y_true, y_pred, year=None):
         is_solar = self.ui.targetToggle.isChecked()
-
+        title = f"Predictions vs Actual" + (f" ({year})" if year else "")
         self.pred_canvas.ax.clear()
         self.pred_canvas.ax.plot(y_true, label="True")
         self.pred_canvas.ax.plot(y_pred, label="Predicted")
-        self.pred_canvas.ax.set_title("Predictions vs Actual")
+        self.pred_canvas.ax.set_title(title)
         self.pred_canvas.ax.set_xlabel("Time Step")
         if is_solar:
             self.pred_canvas.ax.set_ylabel("Solar Radiation (W/m²)")
