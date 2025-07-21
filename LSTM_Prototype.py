@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import copy
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
@@ -18,7 +19,7 @@ from scipy.stats import pearsonr
 def train_and_evaluate_lstm(input_csv, model_save_path, 
                             scaler_save_path, 
                             num_epochs=60, 
-                            batch_size=16, 
+                            batch_size=64, 
                             test_size=0.2, 
                             random_state=42, 
                             progress_callback=None, 
@@ -48,10 +49,10 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
         if datetime_col != 'date time':
             data.drop(columns=[datetime_col], inplace=True)
         
-        if date_from and date_to:
-            data = data[(data['date time'] >= pd.Timestamp(date_from)) & 
-                    (data['date time'] <= pd.Timestamp(date_to))]
-            print(f"Filtered data between {date_from} and {date_to}. Remaining rows: {len(data)}")
+        # if date_from and date_to:
+        #     data = data[(data['date time'] >= pd.Timestamp(date_from)) & 
+        #             (data['date time'] <= pd.Timestamp(date_to))]
+        #     print(f"Filtered data between {date_from} and {date_to}. Remaining rows: {len(data)}")
         
         for col in data.columns:
             data[col] = pd.to_numeric(data[col], errors='coerce')
@@ -59,7 +60,7 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
                 columns_to_drop.append(col)
 
         return columns_to_drop, data
-
+    
     def hunt_nans(input_csv):
         # Drop fully NaN columns
         columns_to_drop, data = find_fully_nan_columns(input_csv)
@@ -101,6 +102,39 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
         print(f"y Shape: {y.shape}")
 
         return X, y, remaining_data
+    
+    if date_from and date_to:
+        duration_days = (pd.to_datetime(date_to) - pd.to_datetime(date_from)).days
+        if duration_days < 14:
+            print("Short time range detected (<14 days). Using persistence model instead of LSTM.")
+
+            # Load and clean data
+            _, data = find_fully_nan_columns(input_csv)
+
+            if use_solar:
+                target_col = next((col for col in data.columns if "solar radiation" in col.lower()), None)
+            else:
+                target_col = next((col for col in data.columns if "wind speed" in col.lower()), None)
+
+            if not target_col:
+                raise ValueError("Target column not found for persistence model.")
+
+            target_series = data[target_col].dropna().reset_index(drop=True)
+
+            y_true = target_series[1:].values
+            y_pred = target_series[:-1].values
+
+            r2 = r2_score(y_true, y_pred)
+            mae = mean_absolute_error(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+
+            print(f"Persistence Model Metrics (based on raw column shift):")
+            print(f"  R²:   {r2:.4f}")
+            print(f"  MAE:  {mae:.4f}")
+            print(f"  RMSE: {rmse:.4f}")
+
+            # Return dummy training/test losses and raw data for consistency
+            return [0], [0], data, 1, True
     
     X, y, remaining_data = hunt_nans(input_csv)
     print("Finished loading and processing data")
@@ -144,8 +178,8 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
             ys.append(y[i+seq_length])
         return np.array(Xs), np.array(ys)
 
-    X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_data, seq_length=24)
-    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_data, seq_length=24)
+    X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_data, seq_length=100)
+    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_data, seq_length=100)
     X_train_seq = np.array(X_train_seq, dtype=np.float64)
 
     print("NaNs in X_train:", np.isnan(X_train_seq).sum())
@@ -171,7 +205,7 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
 
     # Define the LSTM model
     class LSTMModel(nn.Module):
-        def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0.2):
+        def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0.25):
             super(LSTMModel, self).__init__()
             self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_rate)
             self.fc = nn.Linear(hidden_size, 1)  # Output 1 value (Wind Speed)
@@ -184,19 +218,23 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
             return out
 
     input_size = X_train.shape[2]  # Number of features
-    hidden_size = 16  # Number of LSTM units
-    num_layers = 1  # Number of LSTM layers
+    hidden_size = 128  # Number of LSTM units
+    num_layers = 3  # Number of LSTM layers
 
     model = LSTMModel(input_size, hidden_size, num_layers).to(device)
 
     # Define loss function and optimizer with L2 regularization
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0003, weight_decay=5e-4)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
 
     # Train the model
     train_losses = []
     test_losses = []
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    
+    
+    best_test_loss = float("inf")
+    patience_counter = 0
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -230,11 +268,22 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
         if progress_callback:
             progress_callback(train_losses[:], test_losses[:])
 
+        if avg_test_loss < best_test_loss:
+            best_test_loss = avg_test_loss
+            patience_counter = 0
+            best_model_state = copy.deepcopy(model.state_dict())
+        else:
+            patience_counter += 1
+            if patience_counter > 10:
+                print("Early stopping triggered.")
+                break
+
     # Save the model
-    torch.save(model.state_dict(), model_save_path)
+    torch.save(best_model_state, model_save_path)
 
     # Save losses to a CSV file
-    loss_df = pd.DataFrame({'epoch': range(1, num_epochs+1), 'train_loss': train_losses, 'test_loss': test_losses})
+    num_actual_epochs = len(train_losses)
+    loss_df = pd.DataFrame({'epoch': range(1, num_actual_epochs+1), 'train_loss': train_losses, 'test_loss': test_losses})
     loss_df.to_csv('training_losses.csv', index=False)
 
     # Evaluate the model using additional metrics
@@ -303,7 +352,7 @@ def train_and_evaluate_lstm(input_csv, model_save_path,
     })
     metrics_df.to_csv('evaluation_metrics.csv', index=False)
 
-    return train_losses, test_losses, remaining_data, input_size
+    return train_losses, test_losses, remaining_data, input_size, False
 
 
 
@@ -318,11 +367,60 @@ def predict(model_path,
             date_to,
             feature_size,
             use_solar=False,
-            plot_path=None):
+            persistence_mode=False):
     # Check if CUDA is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
  
+    if persistence_mode:
+        print("Persistence mode active. Skipping LSTM model loading and prediction.")
+        data = input_csv
+        duration_days = (date_to - date_from).days
+        
+        datetime_col = next((col for col in data.columns if col.lower() == "date time"), None)
+        if not datetime_col:
+            raise ValueError("No 'datetime' column found (case-insensitive match failed).")
+
+        data['date time'] = pd.to_datetime(data[datetime_col])
+        if datetime_col != 'date time':
+            data.drop(columns=[datetime_col], inplace=True)
+
+        # Get most recent year of data
+        latest_year = data['date time'].dt.year.max()
+        target_from = date_from.replace(year=latest_year)
+        target_to = target_from + pd.Timedelta(days=duration_days)
+        target_from = pd.to_datetime(target_from)
+        target_to = pd.to_datetime(target_to)
+
+
+        target_data = data[(data['date time'] >= target_from) & (data['date time'] <= target_to)].copy()
+        target_data = target_data.sort_values('date time').reset_index(drop=True)
+
+        if use_solar:
+            target_col = next((col for col in target_data.columns if "solar radiation" in col.lower()), None)
+            output_col_name = "Predicted Solar Radiation"
+        else:
+            target_col = next((col for col in target_data.columns if "wind speed" in col.lower()), None)
+            output_col_name = "Predicted Wind Speed"
+
+        if not target_col:
+            raise ValueError("Target column not found for persistence model.")
+
+        target_series = target_data[target_col].dropna().reset_index(drop=True)
+        pred_series = target_series.shift(1).dropna().reset_index(drop=True)
+        valid_dates = target_data['date time'][1:].reset_index(drop=True)
+
+        prediction_df = pd.DataFrame({
+            'date time': valid_dates,
+            output_col_name: pred_series
+        })
+
+        prediction_df.to_csv(output_csv, index=False)
+        print(f"Persistence-based predictions saved to {output_csv}")
+
+        return prediction_df
+        
+
     # Define the LSTM model class
     class LSTMModel(nn.Module):
         def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0.3):
@@ -339,8 +437,8 @@ def predict(model_path,
 
     # Load the trained model
     input_size = feature_size  # Adjust according to your number of features
-    hidden_size = 16  # Same as in training
-    num_layers = 1  # Same as in training
+    hidden_size = 128  # Same as in training
+    num_layers = 3  # Same as in training
     model = LSTMModel(input_size, hidden_size, num_layers).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -349,6 +447,7 @@ def predict(model_path,
     xscaler = joblib.load(scaler_path)
     yscaler = joblib.load(scaler_path.replace('.pkl', '_y.pkl'))
     data = input_csv
+
     # Find the datetime column case-insensitively
     datetime_col = next((col for col in data.columns if col.lower() == "date time"), None)
 
@@ -361,11 +460,6 @@ def predict(model_path,
     # Drop original column if it's not already lowercase 'datetime'
     if datetime_col != 'date time':
         data.drop(columns=[datetime_col], inplace=True)
-
-
-    # Load new data for prediction
-    new_data = input_csv
-    print('Finished loading new data')
 
     # --- Calculate date range in terms of duration and relative offset ---
     duration = date_to - date_from
@@ -401,7 +495,11 @@ def predict(model_path,
     # Standardize the features
     X_new_scaled = xscaler.transform(X_new)
 
-    X_new_scaled_seq = create_inference_sequences(X_new_scaled, seq_length=24)
+    X_new_scaled_seq = create_inference_sequences(X_new_scaled, seq_length=100)
+
+    print(f"Input to scaler shape: {X_new.shape}")
+    print(f"After sequencing: {X_new_scaled_seq.shape}")
+
 
     X_new_tensor = torch.tensor(X_new_scaled_seq, dtype=torch.float32).to(device)
     batch_size = 16
@@ -417,7 +515,7 @@ def predict(model_path,
     
     # Concatenate all batches
     predictions = torch.cat(predictions, dim=0).numpy()   
-    valid_dates = pred_df['date time'].values[24:]  # Skip first 24 to match the number of sequences
+    valid_dates = pred_df['date time'].values[100:]  # Skip first 24 to match the number of sequences
     
     #Reshape predictions to match the expected output
     predictions = yscaler.inverse_transform(predictions)
